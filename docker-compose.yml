@@ -1,0 +1,83 @@
+services:
+  # db:
+  #   image: mysql:latest
+  #   container_name: mysql_generic
+  #   restart: always
+  #   environment:
+  #     MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+  #     MYSQL_DATABASE: ${MYSQL_DATABASE}
+  #     MYSQL_USER: ${MYSQL_USER}
+  #     MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+  #   ports:
+  #     - '3306:3306'
+  #   volumes:
+  #     - mysql_data:/var/lib/mysql
+
+  postgres:
+    image: postgres:latest
+    container_name: postgres_generic
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - '54321:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql
+
+  # redis://:YOUR_STRONG_PASSWORD_HERE@valkey.yourdomain.com:16379/0
+  valkey:
+      image: valkey/valkey:9.1
+      container_name: valkey_generic
+      restart: unless-stopped
+      ports:
+        - "${VALKEY_PORT}:6379"
+      command: >
+        valkey-server
+        --appendonly yes
+        --maxmemory 1gb
+        --maxmemory-policy noeviction
+        --requirepass ${VALKEY_PASSWORD}
+      volumes:
+        - valkey_data:/data
+      healthcheck:
+        test: ["CMD-SHELL", "valkey-cli --no-auth-warning -a ${VALKEY_PASSWORD} ping | grep -q PONG"]
+        interval: 10s
+        timeout: 5s
+        retries: 3
+      # Optional: limit container to 1 CPU and 6 GB RAM
+      mem_limit: 6g
+      cpus: 1.0
+
+  # redis://default:Nlg13PVOXzaOd5AgmYE1XunM@valkey:6379
+  # redis://default:Nlg13PVOXzaOd5AgmYE1XunM@epicurus.oldhat.dev:6379
+  redis-insight:
+      image: redis/redisinsight:latest
+      container_name: valkey_ui
+      restart: always
+      ports:
+        - '8001:5540'
+      volumes:
+        - redisinsight_data:/data
+      depends_on:
+        - valkey
+
+  # phpmyadmin:
+  #   image: phpmyadmin:latest
+  #   container_name: phpmyadmin_ui
+  #   restart: always
+  #   depends_on:
+  #     - db
+  #   environment:
+  #     PMA_HOST: db
+  #     PMA_PORT: 3306
+  #     PMA_ARBITRARY: 1
+  #   ports:
+  #     - '8080:80'
+
+volumes:
+  mysql_data:
+  postgres_data:
+  valkey_data:
+  redisinsight_data:
