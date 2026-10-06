@@ -1,5 +1,6 @@
-cv
-valkey-data
-ai-kanban
-dsh-ask.sh
+# Secrets -- never commit. See .env.example for the required keys.
 .env
+
+# macOS metadata
+.DS_Store
+

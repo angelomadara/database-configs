@@ -1,72 +1,217 @@
+# ---------------------------------------------------------------------------
+# database-configs -- generic datastore stack
+#
+# Conventions in this file:
+#   * Images are pinned to an exact minor version. `latest` on a database is a
+#     landmine: postgres:latest is currently PG 18, and the day it flips to 19
+#     every `docker pull` + restart boots a PG 19 binary against a PG 18 data
+#     directory, which the entrypoint refuses to start (crash loop, not upgrade).
+#   * Every service caps its container logs. The daemon has no /etc/docker/
+#     daemon.json, so without this the json-file driver grows without bound.
+#   * Host resources here: 5.8 GiB RAM, 1 vCPU, no swap. Limits below are sized
+#     against that, not against a generic machine.
+# ---------------------------------------------------------------------------
+
 services:
+
+  # MySQL template -- disabled. Uncomment it together with the phpmyadmin block
+  # at the bottom and the mysql_data volume.
   # db:
-  #   image: mysql:latest
+  #   image: mysql:8.4
   #   container_name: mysql_generic
-  #   restart: always
+  #   restart: unless-stopped
   #   environment:
   #     MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
   #     MYSQL_DATABASE: ${MYSQL_DATABASE}
   #     MYSQL_USER: ${MYSQL_USER}
   #     MYSQL_PASSWORD: ${MYSQL_PASSWORD}
   #   ports:
-  #     - '3306:3306'
+  #     - '127.0.0.1:3306:3306'
   #   volumes:
   #     - mysql_data:/var/lib/mysql
 
   postgres:
-    image: postgres:latest
+    image: postgres:18.6
     container_name: postgres_generic
-    restart: always
+    restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
     ports:
-      - '54321:5432'
+      # Loopback-only. This was 0.0.0.0:54321, i.e. a database reachable from
+      # the internet with password auth as the only barrier. Reach it with:
+      #   ssh -L 54321:127.0.0.1:54321 ubuntu@138.2.67.246
+      # then connect to localhost:54321. Revert to '54321:5432' if a remote
+      # client genuinely needs a direct connection.
+      - '127.0.0.1:54321:5432'
     volumes:
+      # Mount the PARENT of PGDATA, not /var/lib/postgresql/data. PG 18 moved
+      # PGDATA to /var/lib/postgresql/18/docker, and keeping the version nested
+      # inside the volume is what makes a future pg_upgrade possible.
       - postgres_data:/var/lib/postgresql
+    shm_size: 128mb
+    mem_limit: 1g
+    memswap_limit: 1g
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
-  # redis://:YOUR_STRONG_PASSWORD_HERE@valkey.yourdomain.com:16379/0
+  # redis://:<password>@<host>:16379/0
   valkey:
-      image: valkey/valkey:9.1
-      container_name: valkey_generic
-      restart: unless-stopped
-      ports:
-        - "${VALKEY_PORT}:6379"
-      command: >
-        valkey-server
-        --appendonly yes
-        --maxmemory 1gb
-        --maxmemory-policy noeviction
-        --requirepass ${VALKEY_PASSWORD}
-      volumes:
-        - valkey_data:/data
-      healthcheck:
-        test: ["CMD-SHELL", "valkey-cli --no-auth-warning -a ${VALKEY_PASSWORD} ping | grep -q PONG"]
-        interval: 10s
-        timeout: 5s
-        retries: 3
-      # Optional: limit container to 1 CPU and 6 GB RAM
-      mem_limit: 6g
-      cpus: 1.0
+    # Floating minor tag (9.1 -> 9.1.2 today) is a deliberate pin. Do not use
+    # `latest`, and bump this deliberately alongside a check of the changelog.
+    image: valkey/valkey:9.1.2
+    container_name: valkey_generic
+    restart: unless-stopped
 
-  # redis://default:Nlg13PVOXzaOd5AgmYE1XunM@valkey:6379
-  # redis://default:Nlg13PVOXzaOd5AgmYE1XunM@epicurus.oldhat.dev:6379
+    # Fail closed if the password is missing, then hand off to the image's own
+    # entrypoint so it still chowns /data and drops root -> valkey (uid 999).
+    # tini is kept in front (as in the image's default ENTRYPOINT) so PID 1
+    # still reaps children and forwards signals.
+    #
+    # Without this guard, `--requirepass ${VALKEY_PASSWORD}` with an unset
+    # variable resolves to `--requirepass ""`, and an empty requirepass means
+    # NO AUTH AT ALL -- while a `valkey-cli -a "" ping` healthcheck still
+    # reports healthy, because it prints PONG on stdout regardless.
+    # Verified on this host: an unguarded empty password yields a fully open
+    # instance that Docker reports as `(healthy)`.
+    #
+    # The doubled $$ is required: compose must not interpolate here, the shell
+    # inside the container does.
+    entrypoint: ["tini", "--", "sh", "-c"]
+    command:
+      - |
+        set -eu
+        if [ -z "$${VALKEY_PASSWORD:-}" ]; then
+          echo "FATAL: VALKEY_PASSWORD is unset or empty." >&2
+          echo "       Refusing to start valkey with no authentication." >&2
+          exit 1
+        fi
+
+        # valkey-server does NOT expand environment variables inside a config
+        # file: `requirepass $${VALKEY_PASSWORD}` is stored as that literal
+        # string, i.e. a fixed, guessable password. So materialise the real
+        # value into a runtime copy of the config and start valkey on that.
+        # It lives in the container only -- never in the image, the repo, or
+        # the data volume. Verified against valkey 9.1.2.
+        umask 077
+        mkdir -p /run/valkey
+        esc=$$(printf '%s' "$$VALKEY_PASSWORD" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        {
+          cat /usr/local/etc/valkey/valkey.conf
+          printf 'requirepass "%s"\n' "$$esc"
+        } > /run/valkey/valkey.conf
+        # valkey drops to uid 999 via the image entrypoint, so both the
+        # directory and the file must be readable by it.
+        chown -R valkey:valkey /run/valkey
+
+        exec docker-entrypoint.sh valkey-server /run/valkey/valkey.conf
+
+    environment:
+      # Read by the entrypoint above, which refuses to start without it and
+      # appends it to the runtime config. Keeping it in the environment (not
+      # in argv) means it is no longer readable by any local user via
+      # /proc/<pid>/cmdline.
+      VALKEY_PASSWORD: ${VALKEY_PASSWORD}
+      # Used by the healthcheck so the password is not repeated in argv there.
+      REDISCLI_AUTH: ${VALKEY_PASSWORD}
+
+    ports:
+      # NOTE ON LAYERING: Docker publishes ports via DNAT in the nat/DOCKER
+      # chain, which bypasses the host's INPUT chain entirely. This host's
+      # iptables INPUT (ACCEPT 22, 80, 443 then REJECT) therefore does NOT
+      # govern this port -- the OCI VCN security list is the only control in
+      # front of it. Left published because your clients connect directly here
+      # and nginx has no `stream {}` (the stream module is not installed, so a
+      # TCP proxy is not currently possible).
+      #
+      # Host port comes from VALKEY_PORT in .env, defaulting to 16379. The
+      # default matters: with the variable unset, compose renders NO published
+      # host port at all (verified), which silently cuts off every remote
+      # client instead of failing loudly.
+      #
+      # To take it off the public interface, use
+      # '127.0.0.1:${VALKEY_PORT:-16379}:6379' and reach it over an SSH
+      # tunnel -- only after confirming nothing connects remotely.
+      - "${VALKEY_PORT:-16379}:6379"
+
+    volumes:
+      - valkey_data:/data
+      # Read-only: valkey must never rewrite the config it was started with.
+      - ./valkey.conf:/usr/local/etc/valkey/valkey.conf:ro
+
+    healthcheck:
+      # PING via REDISCLI_AUTH from the environment -- no password in argv.
+      # 'valkey-cli ping' exits non-zero when auth fails, so this actually
+      # detects a misconfigured password instead of greening out.
+      test: ["CMD-SHELL", "valkey-cli --no-auth-warning ping | grep -q PONG"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # A cold start with a large AOF can take a while; without this you get
+      # spurious restarts before valkey has finished loading.
+      start_period: 30s
+
+    # maxmemory in valkey.conf is 1gb. The limit here is 2g because RDB/AOF
+    # fork() uses copy-on-write and can transiently push RSS toward 2x the
+    # dataset. A limit of 6g was meaningless on a 5.8 GiB host: the kernel OOM
+    # killer would fire long before the cgroup limit and could pick a victim
+    # other than valkey. If you want to be tighter, drop maxmemory to 512mb
+    # and this limit to 1g.
+    mem_limit: 2g
+    # == mem_limit means "no swap". The host has 0 swap configured, so this
+    # just stops Docker from implying a 4g swap allowance that does not exist.
+    memswap_limit: 2g
+    # No-op on a 1-vCPU host; kept so the cap is already correct if the VM is
+    # ever resized.
+    cpus: 1.0
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # redis://default:<password>@valkey:6379/0     (in-network)
   redis-insight:
-      image: redis/redisinsight:latest
-      container_name: valkey_ui
-      restart: always
-      ports:
-        - '8001:5540'
-      volumes:
-        - redisinsight_data:/data
-      depends_on:
-        - valkey
+    # 3.8.0 is the multi-arch tag; 3.8.0-arm64 is single-arch, so do not use it.
+    image: redis/redisinsight:3.8.0
+    container_name: valkey_ui
+    restart: unless-stopped
+    ports:
+      # Loopback-only on purpose. RedisInsight 2.x/3.x ships with NO
+      # authentication of its own: anything that can reach the port gets an
+      # admin UI and whatever saved connection profiles it holds. Tunnel in:
+      #   ssh -L 8001:127.0.0.1:8001 ubuntu@138.2.67.246
+      - '127.0.0.1:8001:5540'
+    volumes:
+      - redisinsight_data:/data
+    depends_on:
+      valkey:
+        # Waits for the healthcheck, not merely for the container to start.
+        condition: service_healthy
+    mem_limit: 512m
+    memswap_limit: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
+  # phpmyadmin -- enable alongside the `db` service.
   # phpmyadmin:
-  #   image: phpmyadmin:latest
+  #   image: phpmyadmin:5
   #   container_name: phpmyadmin_ui
-  #   restart: always
+  #   restart: unless-stopped
   #   depends_on:
   #     - db
   #   environment:
@@ -74,9 +219,10 @@ services:
   #     PMA_PORT: 3306
   #     PMA_ARBITRARY: 1
   #   ports:
-  #     - '8080:80'
+  #     - '127.0.0.1:8080:80'
 
 volumes:
+  # Referenced by the commented-out `db` service; harmless if left unused.
   mysql_data:
   postgres_data:
   valkey_data:
