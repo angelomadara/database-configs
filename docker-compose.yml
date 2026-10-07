@@ -221,9 +221,67 @@ services:
   #   ports:
   #     - '127.0.0.1:8080:80'
 
+  mongodb:
+    image: mongo:6.0.22
+    container_name: mongodb-generic
+    restart: unless-stopped
+    ports:
+      - "${MONGO_PORT}:27017"
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_DB_USER:-admin}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_DB_PASSWORD:-password}
+    volumes:
+      - mongo_data:/data/db
+      - ./logs:/app/logs
+    mem_limit: 4g # Limits the container to 4GB max memory (works with docker compose up)
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        # Generate keyfile inside the container (on persistent volume)
+        # to avoid macOS Docker Desktop permission issues with bind-mounted files.
+        KEYFILE=/data/db/mongo-keyfile
+        if [ ! -f "$$KEYFILE" ]; then
+          openssl rand -base64 756 | tr -d '\n' > "$$KEYFILE"
+          echo "" >> "$$KEYFILE"
+        fi
+        chown 999:999 "$$KEYFILE" 2>/dev/null
+        chmod 400 "$$KEYFILE" 2>/dev/null
+        exec /usr/local/bin/docker-entrypoint.sh "$$@"
+    # Appended --wiredTigerCacheSizeGB 2 to your existing mongod commands below:
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--keyFile", "/data/db/mongo-keyfile", "--wiredTigerCacheSizeGB", "2"]
+    networks:
+      - mongo-network
+
+  # Init-replica: Temporary container to run rs.initiate()
+  mongodb-init:
+    image: mongo:6.0.22
+    container_name: mongodb_init
+    depends_on:
+      - mongodb
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${DB_USER:-admin}
+      - MONGO_INITDB_ROOT_PASSWORD=${DB_PASSWORD:-password}
+    networks:
+      - mongo-network
+    entrypoint:
+      [
+        "/bin/bash",
+        "-c",
+        'sleep 10 && mongosh --host mongodb -u $$MONGO_INITDB_ROOT_USERNAME -p $$MONGO_INITDB_ROOT_PASSWORD --eval "rs.initiate({_id: ''rs0'', members: [{_id: 0, host: ''mongodb:27017''}]})" && echo "Waiting for primary election..." && for i in $(seq 1 30); do mongosh --host mongodb -u $$MONGO_INITDB_ROOT_USERNAME -p $$MONGO_INITDB_ROOT_PASSWORD --quiet --eval "rs.status().members[0].stateStr === ''PRIMARY''" 2>/dev/null | grep -q true && echo "Primary elected!" && break; sleep 2; done',
+      ]
+
 volumes:
   # Referenced by the commented-out `db` service; harmless if left unused.
   mysql_data:
   postgres_data:
   valkey_data:
   redisinsight_data:
+  mongo_data:
+    driver: local
+    name: mongo-generic-data
+
+networks:
+  mongo-network:
+    driver: bridge
+    name: mongo-generic-network
