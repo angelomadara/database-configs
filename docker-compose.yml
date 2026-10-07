@@ -222,54 +222,150 @@ services:
   #     - '127.0.0.1:8080:80'
 
   mongodb:
-    image: mongo:6.0.22
+    # 6.0 reached EOL on 31 Jul 2025, and 6.0.22 predates the fix for
+    # CVE-2025-14847 (MongoBleed: an UNAUTHENTICATED out-of-bounds read, fixed
+    # in 6.0.27). 8.0 is supported until 31 Oct 2029. No migration was needed
+    # for this bump: the service had never been started, so no data existed.
+    image: mongo:8.0.32
     container_name: mongodb-generic
     restart: unless-stopped
     ports:
-      - "${MONGO_PORT}:27017"
+      # Loopback-only, matching postgres and redis-insight. The keyFile below
+      # enables authorization, but that must not be the ONLY barrier: on the
+      # OCI host an 0.0.0.0 bind plus an open security list would publish an
+      # internet-reachable mongod.
+      #
+      # The ':-' default matters for the same reason as VALKEY_PORT above: with
+      # MONGO_PORT unset, compose renders NO published host port at all
+      # (verified), silently cutting off every client instead of failing loudly.
+      - '127.0.0.1:${MONGO_PORT:-27020}:27017'
     environment:
-      - MONGO_INITDB_ROOT_USERNAME=${MONGO_DB_USER:-admin}
-      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_DB_PASSWORD:-password}
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_DB_USER:-admin}
+      # ':?' rather than ':-': a missing password must fail the stack loudly,
+      # not silently resolve to the literal string 'password'. Same reasoning
+      # as the valkey fail-closed guard below.
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_DB_PASSWORD:?MONGO_DB_PASSWORD must be set in .env}
     volumes:
       - mongo_data:/data/db
-      - ./logs:/app/logs
-    mem_limit: 4g # Limits the container to 4GB max memory (works with docker compose up)
-    entrypoint:
-      - /bin/bash
-      - -c
+      # The keyfile lives OUTSIDE dbPath. It is auth material, not database
+      # data, so it must not travel along with a dbpath move or a selective
+      # volume restore.
+      - mongo_keyfile:/data/keyfile
+    # Reduced from 4g: the declared limits in this file alone previously summed
+    # to 7.5 GiB on a 5.77 GiB host, before counting the other stacks already
+    # running on the same daemon. --wiredTigerCacheSizeGB is set explicitly
+    # because WiredTiger sizes its cache from HOST ram, not the cgroup limit.
+    mem_limit: 2g
+    # == mem_limit, as on valkey: the host has no swap.
+    memswap_limit: 2g
+    entrypoint: ["/bin/bash", "-c"]
+    command:
       - |
-        # Generate keyfile inside the container (on persistent volume)
-        # to avoid macOS Docker Desktop permission issues with bind-mounted files.
-        KEYFILE=/data/db/mongo-keyfile
+        set -eu
+        if [ -z "$${MONGO_INITDB_ROOT_PASSWORD:-}" ]; then
+          echo "FATAL: MONGO_DB_PASSWORD is unset or empty." >&2
+          exit 1
+        fi
+
+        # Generate keyfile inside the container (on the persistent volume) to
+        # avoid macOS Docker Desktop permission issues with bind-mounted files.
+        KEYFILE=/data/keyfile/mongo-keyfile
+        mkdir -p /data/keyfile
         if [ ! -f "$$KEYFILE" ]; then
           openssl rand -base64 756 | tr -d '\n' > "$$KEYFILE"
           echo "" >> "$$KEYFILE"
         fi
-        chown 999:999 "$$KEYFILE" 2>/dev/null
-        chmod 400 "$$KEYFILE" 2>/dev/null
-        exec /usr/local/bin/docker-entrypoint.sh "$$@"
-    # Appended --wiredTigerCacheSizeGB 2 to your existing mongod commands below:
-    command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--keyFile", "/data/db/mongo-keyfile", "--wiredTigerCacheSizeGB", "2"]
+        # Errors are deliberately NOT suppressed here: a failed chown/chmod is
+        # exactly what makes mongod refuse to start with the confusing
+        # "permissions on ... are too open" message.
+        chown 999:999 "$$KEYFILE"
+        chmod 400 "$$KEYFILE"
+
+        # mongod args are inlined on purpose. With `entrypoint: [bash, -c]`
+        # plus a command LIST, Docker maps command[0] to $0 and the rest to $@,
+        # so the older `exec docker-entrypoint.sh "$@"` pattern silently drops
+        # the leading 'mongod' and mongod never starts. Passing the argv
+        # explicitly here removes that trap entirely.
+        exec /usr/local/bin/docker-entrypoint.sh mongod \
+          --replSet rs0 \
+          --bind_ip_all \
+          --keyFile /data/keyfile/mongo-keyfile \
+          --wiredTigerCacheSizeGB 1
+    healthcheck:
+      # Authenticated ping. Without a healthcheck, mongodb-init can only wait
+      # on a fixed sleep, which races a cold start.
+      test: ["CMD-SHELL", "mongosh --quiet --host 127.0.0.1 --port 27017 --username \"$$MONGO_INITDB_ROOT_USERNAME\" --password \"$$MONGO_INITDB_ROOT_PASSWORD\" --authenticationDatabase admin --eval 'db.runCommand({ping:1}).ok' | grep -q 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - mongo-network
 
-  # Init-replica: Temporary container to run rs.initiate()
+  # Init-replica: one-shot container that runs rs.initiate() once, then exits 0.
+  # Safe to re-run: it checks rs.status().ok first rather than erroring out on
+  # an already-initialised set (the old version failed on every `up`).
   mongodb-init:
-    image: mongo:6.0.22
+    image: mongo:8.0.32
     container_name: mongodb_init
     depends_on:
-      - mongodb
+      mongodb:
+        # Wait for a working, AUTHENTICATED mongod rather than merely a started
+        # container. Replaces the old fixed `sleep 10` + service_started.
+        condition: service_healthy
+    restart: "no"
     environment:
-      - MONGO_INITDB_ROOT_USERNAME=${DB_USER:-admin}
-      - MONGO_INITDB_ROOT_PASSWORD=${DB_PASSWORD:-password}
+      # These MUST match the mongodb service above. Previously this container
+      # read DB_USER/DB_PASSWORD, which are absent from .env, so it silently
+      # fell back to the literal 'password' while mongod used the real one --
+      # meaning rs.initiate() failed authentication on every single boot and
+      # the replica set was never initiated.
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_DB_USER:-admin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_DB_PASSWORD:?MONGO_DB_PASSWORD must be set in .env}
     networks:
       - mongo-network
-    entrypoint:
-      [
-        "/bin/bash",
-        "-c",
-        'sleep 10 && mongosh --host mongodb -u $$MONGO_INITDB_ROOT_USERNAME -p $$MONGO_INITDB_ROOT_PASSWORD --eval "rs.initiate({_id: ''rs0'', members: [{_id: 0, host: ''mongodb:27017''}]})" && echo "Waiting for primary election..." && for i in $(seq 1 30); do mongosh --host mongodb -u $$MONGO_INITDB_ROOT_USERNAME -p $$MONGO_INITDB_ROOT_PASSWORD --quiet --eval "rs.status().members[0].stateStr === ''PRIMARY''" 2>/dev/null | grep -q true && echo "Primary elected!" && break; sleep 2; done',
-      ]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -u
+        AUTH=(--host mongodb --username "$$MONGO_INITDB_ROOT_USERNAME" --password "$$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --quiet)
+
+        if mongosh "$${AUTH[@]}" --eval 'rs.status().ok' 2>/dev/null | grep -q 1; then
+          echo "Replica set already initiated; nothing to do."
+          exit 0
+        fi
+
+        mongosh "$${AUTH[@]}" --eval 'rs.initiate({_id:"rs0",members:[{_id:0,host:"mongodb:27017"}]})'
+
+        # NOTE: the member advertises itself as "mongodb:27017", which only
+        # resolves inside this compose network. Verified against this stack:
+        #   * external client, plain single-host URI -> works (driver connects
+        #     directly when there is one seed and no replicaSet option)
+        #   * external client with ?replicaSet=rs0   -> MongoNetworkError:
+        #     getaddrinfo ENOTFOUND mongodb
+        #   * in-network client with ?replicaSet=rs0 -> works
+        # So an app reaching this through the published port should either omit
+        # replicaSet= or pass ?directConnection=true, which still supports
+        # transactions against a single-node set.
+        for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+          if mongosh "$${AUTH[@]}" --eval 'rs.status().members[0].stateStr' 2>/dev/null | grep -q PRIMARY; then
+            echo "Primary elected."
+            exit 0
+          fi
+          sleep 2
+        done
+        echo "WARN: no PRIMARY elected within 30s" >&2
+        exit 1
 
 volumes:
   # Referenced by the commented-out `db` service; harmless if left unused.
@@ -280,6 +376,10 @@ volumes:
   mongo_data:
     driver: local
     name: mongo-generic-data
+  # Separate volume for the replica-set keyfile, deliberately kept out of dbPath.
+  mongo_keyfile:
+    driver: local
+    name: mongo-generic-keyfile
 
 networks:
   mongo-network:
